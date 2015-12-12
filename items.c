@@ -46,7 +46,7 @@ typedef struct {
 } itemstats_t;
 
 typedef struct {
-    uint64_t histo[60];
+    uint64_t histo[61];
     uint64_t ttl_hourplus;
     uint64_t noexp;
     uint64_t reclaimed;
@@ -98,7 +98,7 @@ uint64_t get_cas_id(void) {
     return next_id;
 }
 
-static int is_flushed(item *it) {
+int item_is_flushed(item *it) {
     rel_time_t oldest_live = settings.oldest_live;
     uint64_t cas = ITEM_get_cas(it);
     uint64_t oldest_cas = settings.oldest_cas;
@@ -113,6 +113,7 @@ static int is_flushed(item *it) {
 
 static unsigned int noexp_lru_size(int slabs_clsid) {
     int id = CLEAR_LRU(slabs_clsid);
+    id |= NOEXP_LRU;
     unsigned int ret;
     pthread_mutex_lock(&lru_locks[id]);
     ret = sizes[id];
@@ -178,7 +179,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         if (!settings.lru_maintainer_thread) {
             lru_pull_tail(id, COLD_LRU, 0, false, cur_hv);
         }
-        it = slabs_alloc(ntotal, id, &total_chunks);
+        it = slabs_alloc(ntotal, id, &total_chunks, 0);
         if (settings.expirezero_does_not_evict)
             total_chunks -= noexp_lru_size(id);
         if (it == NULL) {
@@ -478,20 +479,6 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     return buffer;
 }
 
-void item_stats_evictions(uint64_t *evicted) {
-    int n;
-    for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
-        int i;
-        int x;
-        for (x = 0; x < 4; x++) {
-            i = n | lru_type_map[x];
-            pthread_mutex_lock(&lru_locks[i]);
-            evicted[n] += itemstats[i].evicted;
-            pthread_mutex_unlock(&lru_locks[i]);
-        }
-    }
-}
-
 void item_stats_totals(ADD_STAT add_stats, void *c) {
     itemstats_t totals;
     memset(&totals, 0, sizeof(itemstats_t));
@@ -712,7 +699,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     }
 
     if (it != NULL) {
-        if (is_flushed(it)) {
+        if (item_is_flushed(it)) {
             do_item_unlink(it, hv);
             do_item_remove(it);
             it = NULL;
@@ -803,7 +790,7 @@ static int lru_pull_tail(const int orig_id, const int cur_lru,
 
         /* Expired or flushed */
         if ((search->exptime != 0 && search->exptime < current_time)
-            || is_flushed(search)) {
+            || item_is_flushed(search)) {
             itemstats[id].reclaimed++;
             if ((search->it_flags & ITEM_FETCHED) == 0) {
                 itemstats[id].expired_unfetched++;
@@ -862,6 +849,9 @@ static int lru_pull_tail(const int orig_id, const int cur_lru,
                     }
                     do_item_unlink_nolock(search, hv);
                     removed++;
+                    if (settings.slab_automove == 2) {
+                        slabs_reassign(-1, orig_id);
+                    }
                 } else if ((search->it_flags & ITEM_ACTIVE) != 0
                         && settings.lru_maintainer_thread) {
                     itemstats[id].moves_to_warm++;
@@ -904,10 +894,21 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     int did_moves = 0;
     bool mem_limit_reached = false;
     unsigned int total_chunks = 0;
+    unsigned int chunks_perslab = 0;
+    unsigned int chunks_free = 0;
     /* TODO: if free_chunks below high watermark, increase aggressiveness */
-    slabs_available_chunks(slabs_clsid, &mem_limit_reached, &total_chunks);
+    chunks_free = slabs_available_chunks(slabs_clsid, &mem_limit_reached,
+            &total_chunks, &chunks_perslab);
     if (settings.expirezero_does_not_evict)
         total_chunks -= noexp_lru_size(slabs_clsid);
+
+    /* If slab automove is enabled on any level, and we have more than 2 pages
+     * worth of chunks free in this class, ask (gently) to reassign a page
+     * from this class back into the global pool (0)
+     */
+    if (settings.slab_automove > 0 && chunks_free > (chunks_perslab * 2.5)) {
+        slabs_reassign(slabs_clsid, SLAB_GLOBAL_PAGE_POOL);
+    }
 
     /* Juggle HOT/WARM up to N times */
     for (i = 0; i < 1000; i++) {
@@ -1138,7 +1139,6 @@ static item *crawler_crawl_q(item *it) {
     item **head, **tail;
     assert(it->it_flags == 1);
     assert(it->nbytes == 0);
-    assert(it->slabs_clsid < LARGEST_ID);
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
 
@@ -1197,7 +1197,7 @@ static void item_crawler_evaluate(item *search, uint32_t hv, int i) {
     crawlerstats_t *s = &crawlerstats[slab_id];
     itemstats[i].crawler_items_checked++;
     if ((search->exptime != 0 && search->exptime < current_time)
-        || is_flushed(search)) {
+        || item_is_flushed(search)) {
         itemstats[i].crawler_reclaimed++;
         s->reclaimed++;
 
@@ -1237,6 +1237,8 @@ static void *item_crawler_thread(void *arg) {
     int crawls_persleep = settings.crawls_persleep;
 
     pthread_mutex_lock(&lru_crawler_lock);
+    pthread_cond_signal(&lru_crawler_cond);
+    settings.lru_crawler = true;
     if (settings.verbose > 2)
         fprintf(stderr, "Starting LRU crawler background thread\n");
     while (do_run_lru_crawler_thread) {
@@ -1329,6 +1331,17 @@ int stop_item_crawler_thread(void) {
     return 0;
 }
 
+/* Lock dance to "block" until thread is waiting on its condition:
+ * caller locks mtx. caller spawns thread.
+ * thread blocks on mutex.
+ * caller waits on condition, releases lock.
+ * thread gets lock, sends signal.
+ * caller can't wait, as thread has lock.
+ * thread waits on condition, releases lock
+ * caller wakes on condition, gets lock.
+ * caller immediately releases lock.
+ * thread is now safely waiting on condition before the caller returns.
+ */
 int start_item_crawler_thread(void) {
     int ret;
 
@@ -1336,7 +1349,6 @@ int start_item_crawler_thread(void) {
         return -1;
     pthread_mutex_lock(&lru_crawler_lock);
     do_run_lru_crawler_thread = 1;
-    settings.lru_crawler = true;
     if ((ret = pthread_create(&item_crawler_tid, NULL,
         item_crawler_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create LRU crawler thread: %s\n",
@@ -1344,6 +1356,8 @@ int start_item_crawler_thread(void) {
         pthread_mutex_unlock(&lru_crawler_lock);
         return -1;
     }
+    /* Avoid returning until the crawler has actually started */
+    pthread_cond_wait(&lru_crawler_cond, &lru_crawler_lock);
     pthread_mutex_unlock(&lru_crawler_lock);
 
     return 0;

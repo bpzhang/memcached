@@ -78,6 +78,7 @@
 /* Slab sizing definitions. */
 #define POWER_SMALLEST 1
 #define POWER_LARGEST  256 /* actual cap is 255 */
+#define SLAB_GLOBAL_PAGE_POOL 0 /* magic slab class for storing pages for reassignment */
 #define CHUNK_ALIGN_BYTES 8
 /* slab class max is a 6-bit number, -1. */
 #define MAX_NUMBER_OF_SLAB_CLASSES (63 + 1)
@@ -285,9 +286,15 @@ struct stats {
     uint64_t      evicted_unfetched; /* items evicted but never touched */
     bool          slab_reassign_running; /* slab reassign in progress */
     uint64_t      slabs_moved;       /* times slabs were moved around */
+    uint64_t      slab_reassign_rescues; /* items rescued during slab move */
+    uint64_t      slab_reassign_evictions_nomem; /* valid items lost during slab move */
+    uint64_t      slab_reassign_inline_reclaim; /* valid items lost during slab move */
+    uint64_t      slab_reassign_busy_items; /* valid temporarily unmovable */
     uint64_t      lru_crawler_starts; /* Number of item crawlers kicked off */
     bool          lru_crawler_running; /* crawl in progress */
     uint64_t      lru_maintainer_juggles; /* number of LRU bg pokes */
+    uint64_t      time_in_listen_disabled_us;  /* elapsed time in microseconds while server unable to process new connections */
+    struct timeval maxconns_entered;  /* last time maxconns entered */
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -523,7 +530,10 @@ struct slab_rebalance {
     void *slab_pos;
     int s_clsid;
     int d_clsid;
-    int busy_items;
+    uint32_t busy_items;
+    uint32_t rescues;
+    uint32_t evictions_nomem;
+    uint32_t inline_reclaim;
     uint8_t done;
 };
 

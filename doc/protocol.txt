@@ -323,7 +323,7 @@ without fetching it.
 
 touch <key> <exptime> [noreply]\r\n
 
-- <key> is the key of the item the client wishes the server to delete
+- <key> is the key of the item the client wishes the server to touch
 
 - <exptime> is expiration time. Works the same as with the update commands
   (set/add/etc). This replaces the existing expiration time. If an existing
@@ -395,7 +395,9 @@ The response should always be "OK\r\n"
 
 - <0> means to set the thread on standby
 
-- <1> means to run the builtin slow algorithm to choose pages to move
+- <1> means to return pages to a global pool when there are more than 2 pages
+  worth of free chunks in a slab class. Pages are then re-assigned back into
+  other classes as-needed.
 
 - <2> is a highly aggressive mode which causes pages to be moved every time
   there is an eviction. It is not recommended to run for very long in this
@@ -527,6 +529,7 @@ integers separated by a colon (treat this as a floating point number).
 | curr_connections      | 32u     | Number of open connections                |
 | total_connections     | 32u     | Total number of connections opened since  |
 |                       |         | the server started running                |
+| rejected_connections  | 64u     | Conns rejected in maxconns_fast mode      |
 | connection_structures | 32u     | Number of connection structures allocated |
 |                       |         | by the server                             |
 | reserved_fds          | 32u     | Number of misc fds used internally        |
@@ -566,6 +569,11 @@ integers separated by a colon (treat this as a floating point number).
 |                       |         | to network                                |
 | limit_maxbytes        | 32u     | Number of bytes this server is allowed to |
 |                       |         | use for storage.                          |
+| accepting_conns       | bool    | Whether or not server is accepting conns  |
+| listen_disabled_num   | 64u     | Number of times server has stopped        |
+|                       |         | accepting new connections (maxconns).     |
+| time_in_listen_disabled_us                                                  |
+|                       | 64u     | Number of microseconds in maxconns.       |
 | threads               | 32u     | Number of worker threads requested.       |
 |                       |         | (see doc/threads.txt)                     |
 | conn_yields           | 64u     | Number of times any connection yielded to |
@@ -593,6 +601,19 @@ integers separated by a colon (treat this as a floating point number).
 | lru_crawler_starts    | 64u     | Times an LRU crawler was started          |
 | lru_maintainer_juggles                                                      |
 |                       | 64u     | Number of times the LRU bg thread woke up |
+| slab_global_page_pool | 32u     | Slab pages returned to global pool for    |
+|                       |         | reassignment to other slab classes.       |
+| slab_reassign_rescues | 64u     | Items rescued from eviction in page move  |
+| slab_reassign_evictions_nomem                                               |
+|                       | 64u     | Valid items evicted during a page move    |
+|                       |         | (due to no free memory in slab)           |
+| slab_reassign_inline_reclaim                                                |
+|                       | 64u     | Internal stat counter for when the page   |
+|                       |         | mover clears memory from the chunk        |
+|                       |         | freelist when it wasn't expecting to.     |
+| slab_reassign_busy_items                                                    |
+|                       | 64u     | Items busy during page move, requiring a  |
+|                       |         | retry before page can be moved.           |
 |-----------------------+---------+-------------------------------------------|
 
 Settings statistics
@@ -725,7 +746,7 @@ you could prevent memcached from serving requests for several seconds.
 
 The data is returned in the following format:
 
-<size> <count>\r\n
+STAT <size> <count>\r\n
 
 The server terminates this list with the line
 

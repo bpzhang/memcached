@@ -185,6 +185,7 @@ static void stats_init(void) {
     stats.slab_reassign_running = false;
     stats.lru_crawler_running = false;
     stats.lru_crawler_starts = 0;
+    stats.time_in_listen_disabled_us = 0;
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
@@ -2623,12 +2624,17 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("limit_maxbytes", "%llu", (unsigned long long)settings.maxbytes);
     APPEND_STAT("accepting_conns", "%u", stats.accepting_conns);
     APPEND_STAT("listen_disabled_num", "%llu", (unsigned long long)stats.listen_disabled_num);
+    APPEND_STAT("time_in_listen_disabled_us", "%llu", stats.time_in_listen_disabled_us);
     APPEND_STAT("threads", "%d", settings.num_threads);
     APPEND_STAT("conn_yields", "%llu", (unsigned long long)thread_stats.conn_yields);
     APPEND_STAT("hash_power_level", "%u", stats.hash_power_level);
     APPEND_STAT("hash_bytes", "%llu", (unsigned long long)stats.hash_bytes);
     APPEND_STAT("hash_is_expanding", "%u", stats.hash_is_expanding);
     if (settings.slab_reassign) {
+        APPEND_STAT("slab_reassign_rescues", "%llu", stats.slab_reassign_rescues);
+        APPEND_STAT("slab_reassign_evictions_nomem", "%llu", stats.slab_reassign_evictions_nomem);
+        APPEND_STAT("slab_reassign_inline_reclaim", "%llu", stats.slab_reassign_inline_reclaim);
+        APPEND_STAT("slab_reassign_busy_items", "%llu", stats.slab_reassign_busy_items);
         APPEND_STAT("slab_reassign_running", "%u", stats.slab_reassign_running);
         APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
     }
@@ -2683,7 +2689,7 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("hash_algorithm", "%s", settings.hash_algorithm);
     APPEND_STAT("lru_maintainer_thread", "%s", settings.lru_maintainer_thread ? "yes" : "no");
     APPEND_STAT("hot_lru_pct", "%d", settings.hot_lru_pct);
-    APPEND_STAT("warm_lru_pct", "%d", settings.hot_lru_pct);
+    APPEND_STAT("warm_lru_pct", "%d", settings.warm_lru_pct);
     APPEND_STAT("expirezero_does_not_evict", "%s", settings.expirezero_does_not_evict ? "yes" : "no");
 }
 
@@ -3952,12 +3958,20 @@ void do_accept_new_conns(const bool do_accept) {
     }
 
     if (do_accept) {
+        struct timeval maxconns_exited;
+        uint64_t elapsed_us;
+        gettimeofday(&maxconns_exited,NULL);
         STATS_LOCK();
+        elapsed_us =
+            (maxconns_exited.tv_sec - stats.maxconns_entered.tv_sec) * 1000000
+            + (maxconns_exited.tv_usec - stats.maxconns_entered.tv_usec);
+        stats.time_in_listen_disabled_us += elapsed_us;
         stats.accepting_conns = true;
         STATS_UNLOCK();
     } else {
         STATS_LOCK();
         stats.accepting_conns = false;
+        gettimeofday(&stats.maxconns_entered,NULL);
         stats.listen_disabled_num++;
         STATS_UNLOCK();
         allow_new_conns = false;
@@ -4614,15 +4628,40 @@ static int server_sockets(int port, enum network_transport transport,
              p != NULL;
              p = strtok_r(NULL, ";,", &b)) {
             int the_port = port;
-            char *s = strchr(p, ':');
-            if (s != NULL) {
-                *s = '\0';
-                ++s;
-                if (!safe_strtol(s, &the_port)) {
-                    fprintf(stderr, "Invalid port number: \"%s\"", s);
+
+            char *h = NULL;
+            if (*p == '[') {
+                // expecting it to be an IPv6 address enclosed in []
+                // i.e. RFC3986 style recommended by RFC5952
+                char *e = strchr(p, ']');
+                if (e == NULL) {
+                    fprintf(stderr, "Invalid IPV6 address: \"%s\"", p);
                     return 1;
                 }
+                h = ++p; // skip the opening '['
+                *e = '\0';
+                p = ++e; // skip the closing ']'
             }
+
+            char *s = strchr(p, ':');
+            if (s != NULL) {
+                // If no more semicolons - attempt to treat as port number.
+                // Otherwise the only valid option is an unenclosed IPv6 without port, until
+                // of course there was an RFC3986 IPv6 address previously specified -
+                // in such a case there is no good option, will just send it to fail as port number.
+                if (strchr(s + 1, ':') == NULL || h != NULL) {
+                    *s = '\0';
+                    ++s;
+                    if (!safe_strtol(s, &the_port)) {
+                        fprintf(stderr, "Invalid port number: \"%s\"", s);
+                        return 1;
+                    }
+                }
+            }
+
+            if (h != NULL)
+                p = h;
+
             if (strcmp(p, "*") == 0) {
                 p = NULL;
             }
@@ -4819,7 +4858,7 @@ static void usage(void) {
            "              requests process for a given connection to prevent \n"
            "              starvation (default: 20)\n");
     printf("-C            Disable use of CAS\n");
-    printf("-b            Set the backlog queue limit (default: 1024)\n");
+    printf("-b <num>      Set the backlog queue limit (default: 1024)\n");
     printf("-B            Binding protocol - one of ascii, binary, or auto (default)\n");
     printf("-I            Override the size of each slab page. Adjusts max item size\n"
            "              (default: 1mb, min: 1k, max: 128m)\n");
@@ -5045,7 +5084,7 @@ static bool sanitycheck(void) {
     if (ever != NULL) {
         if (strncmp(ever, "1.", 2) == 0) {
             /* Require at least 1.3 (that's still a couple of years old) */
-            if ((ever[2] == '1' || ever[2] == '2') && !isdigit(ever[3])) {
+            if (('0' <= ever[2] && ever[2] < '3') && !isdigit(ever[3])) {
                 fprintf(stderr, "You are using libevent %s.\nPlease upgrade to"
                         " a more recent version (1.3 or newer)\n",
                         event_get_version());
@@ -5084,7 +5123,7 @@ int main (int argc, char **argv) {
     enum hashfunc_type hash_type = JENKINS_HASH;
     uint32_t tocrawl;
 
-    char *subopts;
+    char *subopts, *subopts_orig;
     char *subopts_value;
     enum {
         MAXCONNS_FAST = 0,
@@ -5216,6 +5255,9 @@ int main (int argc, char **argv) {
             break;
         case 'l':
             if (settings.inter != NULL) {
+                if (strstr(settings.inter, optarg) != NULL) {
+                    break;
+                }
                 size_t len = strlen(settings.inter) + strlen(optarg) + 2;
                 char *p = malloc(len);
                 if (p == NULL) {
@@ -5331,6 +5373,7 @@ int main (int argc, char **argv) {
             } else {
                 settings.item_size_max = atoi(buf);
             }
+            free(buf);
             if (settings.item_size_max < 1024) {
                 fprintf(stderr, "Item max size cannot be less than 1024 bytes.\n");
                 return 1;
@@ -5346,7 +5389,6 @@ int main (int argc, char **argv) {
                     " and will decrease your memory efficiency.\n"
                 );
             }
-            free(buf);
             break;
         case 'S': /* set Sasl authentication to true. Default is false */
 #ifndef ENABLE_SASL
@@ -5359,7 +5401,7 @@ int main (int argc, char **argv) {
             settings.flush_enabled = false;
             break;
         case 'o': /* It's sub-opts time! */
-            subopts = optarg;
+            subopts_orig = subopts = strdup(optarg); /* getsubopt() changes the original args */
 
             while (*subopts != '\0') {
 
@@ -5427,6 +5469,10 @@ int main (int argc, char **argv) {
                 start_lru_crawler = true;
                 break;
             case LRU_CRAWLER_SLEEP:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing lru_crawler_sleep value\n");
+                    return 1;
+                }
                 settings.lru_crawler_sleep = atoi(subopts_value);
                 if (settings.lru_crawler_sleep > 1000000 || settings.lru_crawler_sleep < 0) {
                     fprintf(stderr, "LRU crawler sleep must be between 0 and 1 second\n");
@@ -5434,6 +5480,10 @@ int main (int argc, char **argv) {
                 }
                 break;
             case LRU_CRAWLER_TOCRAWL:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing lru_crawler_tocrawl value\n");
+                    return 1;
+                }
                 if (!safe_strtoul(subopts_value, &tocrawl)) {
                     fprintf(stderr, "lru_crawler_tocrawl takes a numeric 32bit value\n");
                     return 1;
@@ -5474,6 +5524,7 @@ int main (int argc, char **argv) {
             }
 
             }
+            free(subopts_orig);
             break;
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
