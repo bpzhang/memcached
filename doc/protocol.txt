@@ -165,7 +165,8 @@ cas <key> <flags> <exptime> <bytes> <cas unique> [noreply]\r\n
   items). If it's non-zero (either Unix time or offset in seconds from
   current time), it is guaranteed that clients will not be able to
   retrieve this item after the expiration time arrives (measured by
-  server time).
+  server time). If a negative value is given the item is immediately
+  expired.
 
 - <bytes> is the number of bytes in the data block to follow, *not*
   including the delimiting \r\n. <bytes> may be zero (in which case
@@ -207,7 +208,7 @@ with a "cas" command did not exist.
 Retrieval command:
 ------------------
 
-The retrieval commands "get" and "gets" operates like this:
+The retrieval commands "get" and "gets" operate like this:
 
 get <key>*\r\n
 gets <key>*\r\n
@@ -403,6 +404,41 @@ The response should always be "OK\r\n"
   there is an eviction. It is not recommended to run for very long in this
   mode unless your access patterns are very well understood.
 
+LRU Tuning
+----------
+
+Memcached supports multiple LRU algorithms, with a few tunables. Effort is
+made to have sane defaults however you are able to tune while the daemon is
+running.
+
+The traditional model is "flat" mode, which is a single LRU chain per slab
+class. The newer (with `-o modern` or `-o lru_maintainer`) is segmented into
+HOT, WARM, COLD. There is also a TEMP LRU. See doc/new_lru.txt for details.
+
+lru <tune|mode|temp_ttl> <option list>
+
+- "tune" takes numeric arguments "percent hot", "percent warm",
+  "max hot age", "max warm age factor". IE: "lru tune 10 25 3600 2.0".
+  This would cap HOT_LRU at 10% of the cache, or tail is idle longer than
+  3600s. WARM_LRU is up to 25% of cache, or tail is idle longer than 2x
+  COLD_LRU.
+
+- "mode" <flat|segmented>: "flat" is traditional mode. "segmented" uses
+  HOT|WARM|COLD split. "segmented" mode requires `-o lru_maintainer` at start
+  time. If switching from segmented to flat mode, the background thread will
+  pull items from HOT|WARM into COLD queue.
+
+- "temp_ttl" <ttl>: If TTL is less than zero, disable usage of TEMP_LRU. If
+  zero or above, items set with a TTL lower than this will go into TEMP_LRU
+  and be unevictable until they naturally expire or are otherwise deleted or
+  replaced.
+
+The response line could be one of:
+
+- "OK" to indicate a successful update of the settings.
+
+- "ERROR [message]" to indicate a failure or improper arguments.
+
 LRU_Crawler
 -----------
 
@@ -467,6 +503,71 @@ The response line could be one of:
 
 - "BADCLASS [message]" to indicate an invalid class was specified.
 
+lru_crawler metadump <classid,classid,classid|all>
+
+- Similar in function to the above "lru_crawler crawl" command, this function
+  outputs one line for every valid item found in the matching slab classes.
+  Similar to "cachedump", but does not lock the cache and can return all
+  items, not just 1MB worth.
+
+  Lines are in "key=value key2=value2" format, with value being URI encoded
+  (ie: %20 for a space).
+
+  The exact keys available are subject to change, but will include at least:
+
+  "key", "exp" (expiration time), "la", (last access time), "cas",
+  "fetch" (if item has been fetched before).
+
+The response line could be one of:
+
+- "OK" to indicate successful launch.
+
+- "BUSY [message]" to indicate the crawler is already processing a request.
+
+- "BADCLASS [message]" to indicate an invalid class was specified.
+
+Watchers
+--------
+
+Watchers are a way to connect to memcached and inspect what's going on
+internally. This is an evolving feature so new endpoints should show up over
+time.
+
+watch <fetchers|mutations|evictions>
+
+- Turn connection into a watcher. Options can be stacked and are
+  space-separated. Logs will be sent to the watcher until it disconnects.
+
+The response line could be one of:
+
+- "OK" to indicate the watcher is ready to send logs.
+
+- "ERROR [message]" something went wrong while enabling.
+
+The response format is in "key=value key2=value2" format, for easy parsing.
+Lines are prepending with "ts=" for a timestamp and "gid=" for a global ID
+number of the log line. Given how logs are collected internally they may be
+printed out of order. If this is important the GID may be used to put log
+lines back in order.
+
+The value of keys (and potentially other things) are "URI encoded". Since most
+keys used conform to standard ASCII, this should have no effect. For keys with
+less standard or binary characters, "%NN"'s are inserted to represent the
+byte, ie: "n%2Cfoo" for "n,foo".
+
+The arguments are:
+
+- "fetchers": Currently emits logs every time an item is fetched internally.
+  This means a "set" command would also emit an item_get log, as it checks for
+  an item before replacing it. Multigets should also emit multiple lines.
+
+- "mutations": Currently emits logs when an item is stored in most cases.
+  Shows errors for most cases when items cannot be stored.
+
+- "evictions": Shows some information about items as they are evicted from the
+  cache. Useful in seeing if items being evicted were actually used, and which
+  keys are getting removed.
+
 Statistics
 ----------
 
@@ -521,8 +622,8 @@ integers separated by a colon (treat this as a floating point number).
 |                       |         | (seconds:microseconds)                    |
 | rusage_system         | 32u.32u | Accumulated system time for this process  |
 |                       |         | (seconds:microseconds)                    |
-| curr_items            | 32u     | Current number of items stored            |
-| total_items           | 32u     | Total number of items stored since        |
+| curr_items            | 64u     | Current number of items stored            |
+| total_items           | 64u     | Total number of items stored since        |
 |                       |         | the server started                        |
 | bytes                 | 64u     | Current number of bytes used              |
 |                       |         | to store items                            |
@@ -541,6 +642,10 @@ integers separated by a colon (treat this as a floating point number).
 |                       |         | and found present                         |
 | get_misses            | 64u     | Number of items that have been requested  |
 |                       |         | and not found                             |
+| get_expired           | 64u     | Number of items that have been requested  |
+|                       |         | but had already expired.                  |
+| get_flushed           | 64u     | Number of items that have been requested  |
+|                       |         | but have been flushed via flush_all       |
 | delete_misses         | 64u     | Number of deletions reqs for missing keys |
 | delete_hits           | 64u     | Number of deletion reqs resulting in      |
 |                       |         | an item being removed.                    |
@@ -559,6 +664,8 @@ integers separated by a colon (treat this as a floating point number).
 | auth_cmds             | 64u     | Number of authentication commands         |
 |                       |         | handled, success or failure.              |
 | auth_errors           | 64u     | Number of failed authentications.         |
+| idle_kicks            | 64u     | Number of connections closed due to       |
+|                       |         | reaching their idle timeout.              |
 | evictions             | 64u     | Number of valid items removed from cache  |
 |                       |         | to free memory for new items              |
 | reclaimed             | 64u     | Number of times an entry was stored using |
@@ -567,7 +674,7 @@ integers separated by a colon (treat this as a floating point number).
 |                       |         | from network                              |
 | bytes_written         | 64u     | Total number of bytes sent by this server |
 |                       |         | to network                                |
-| limit_maxbytes        | 32u     | Number of bytes this server is allowed to |
+| limit_maxbytes        | size_t  | Number of bytes this server is allowed to |
 |                       |         | use for storage.                          |
 | accepting_conns       | bool    | Whether or not server is accepting conns  |
 | listen_disabled_num   | 64u     | Number of times server has stopped        |
@@ -587,10 +694,12 @@ integers separated by a colon (treat this as a floating point number).
 |                       |         | expiring                                  |
 | evicted_unfetched     | 64u     | Items evicted from LRU that were never    |
 |                       |         | touched by get/incr/append/etc.           |
+| evicted_active        | 64u     | Items evicted from LRU that had been hit  |
+|                       |         | recently but did not jump to top of LRU   |
 | slab_reassign_running | bool    | If a slab page is being moved             |
 | slabs_moved           | 64u     | Total slab pages moved                    |
 | crawler_reclaimed     | 64u     | Total items freed by LRU Crawler          |
-| crawler_items-checked | 64u     | Total items examined by LRU Crawler       |
+| crawler_items_checked | 64u     | Total items examined by LRU Crawler       |
 | lrutail_reflocked     | 64u     | Times LRU tail was found with active ref. |
 |                       |         | Items can be evicted to avoid OOM errors. |
 | moves_to_cold         | 64u     | Items moved from HOT/WARM to COLD LRU's   |
@@ -607,6 +716,9 @@ integers separated by a colon (treat this as a floating point number).
 | slab_reassign_evictions_nomem                                               |
 |                       | 64u     | Valid items evicted during a page move    |
 |                       |         | (due to no free memory in slab)           |
+| slab_reassign_chunk_rescues                                                 |
+|                       | 64u     | Individual sections of an item rescued    |
+|                       |         | during a page move.                       |
 | slab_reassign_inline_reclaim                                                |
 |                       | 64u     | Internal stat counter for when the page   |
 |                       |         | mover clears memory from the chunk        |
@@ -614,6 +726,10 @@ integers separated by a colon (treat this as a floating point number).
 | slab_reassign_busy_items                                                    |
 |                       | 64u     | Items busy during page move, requiring a  |
 |                       |         | retry before page can be moved.           |
+| log_worker_dropped    | 64u     | Logs a worker never wrote due to full buf |
+| log_worker_written    | 64u     | Logs written by a worker, to be picked up |
+| log_watcher_skipped   | 64u     | Logs not sent to slow watchers.           |
+| log_watcher_sent      | 64u     | Logs written to watchers.                 |
 |-----------------------+---------+-------------------------------------------|
 
 Settings statistics
@@ -632,7 +748,7 @@ other stats command.
 |-------------------+----------+----------------------------------------------|
 | Name              | Type     | Meaning                                      |
 |-------------------+----------+----------------------------------------------|
-| maxbytes          | size_t   | Maximum number of bytes allows in this cache |
+| maxbytes          | size_t   | Maximum number of bytes allowed in the cache |
 | maxconns          | 32       | Maximum number of clients allowed.           |
 | tcpport           | 32       | TCP listen port.                             |
 | udpport           | 32       | UDP listen port.                             |
@@ -656,17 +772,33 @@ other stats command.
 | hashpower_init    | 32       | Starting size multiplier for hash table      |
 | slab_reassign     | bool     | Whether slab page reassignment is allowed    |
 | slab_automove     | bool     | Whether slab page automover is enabled       |
+| slab_chunk_max    | 32       | Max slab class size (avoid unless necessary) |
 | hash_algorithm    | char     | Hash table algorithm in use                  |
 | lru_crawler       | bool     | Whether the LRU crawler is enabled           |
 | lru_crawler_sleep | 32       | Microseconds to sleep between LRU crawls     |
 | lru_crawler_tocrawl                                                         |
-|                   | 32u     | Max items to crawl per slab per run           |
+|                   | 32u      | Max items to crawl per slab per run          |
 | lru_maintainer_thread                                                       |
-|                   | bool    | Split LRU mode and background threads         |
-| hot_lru_pct       | 32      | Pct of slab memory reserved for HOT LRU       |
-| warm_lru_pct      | 32      | Pct of slab memory reserved for WARM LRU      |
-| expirezero_does_not_evict                                                   |
-|                   | bool    | If yes, items with 0 exptime cannot evict     |
+|                   | bool     | Split LRU mode and background threads        |
+| hot_lru_pct       | 32       | Pct of slab memory reserved for HOT LRU      |
+| warm_lru_pct      | 32       | Pct of slab memory reserved for WARM LRU     |
+| hot_max_age       | 32u      | Max idle age of items in HOT LRU             |
+| warm_max_factor   | float    | Set idle age of WARM LRU to COLD age * this  |
+| temp_lru          | bool     | If yes, items < temporary_ttl use TEMP_LRU   |
+| temporary_ttl     | 32u      | Items with TTL < this are marked  temporary  |
+| idle_time         | 0        | Drop connections that are idle this many     |
+|                   |          | seconds (0 disables)                         |
+| watcher_logbuf_size                                                         |
+|                   | 32u      | Size of internal (not socket) write buffer   |
+|                   |          | per active watcher connected.                |
+| worker_logbuf_size| 32u      | Size of internal per-worker-thread buffer    |
+|                   |          | which the background thread reads from.      |
+| track_sizes       | bool     | If yes, a "stats sizes" histogram is being   |
+|                   |          | dymamically tracked.                         |
+| inline_ascii_response                                                       |
+|                   | bool     | If yes, stores numbers from VALUE response   |
+|                   |          | inside an item, using up to 24 bytes.        |
+|                   |          | Small slowdown for ASCII get, faster sets.   |
 |-------------------+----------+----------------------------------------------|
 
 
@@ -697,7 +829,9 @@ number                 Number of items presently stored in this class. Expired
 number_hot             Number of items presently stored in the HOT LRU.
 number_warm            Number of items presently stored in the WARM LRU.
 number_cold            Number of items presently stored in the COLD LRU.
-number_noexp           Number of items presently stored in the NOEXP class.
+number_temp            Number of items presently stored in the TEMPORARY LRU.
+age_hot                Age of the oldest item in HOT LRU.
+age_warm               Age of the oldest item in WARM LRU.
 age                    Age of the oldest item in the LRU.
 evicted                Number of times an item had to be evicted from the LRU
                        before it expired.
@@ -719,6 +853,9 @@ expired_unfetched      Number of expired items reclaimed from the LRU which
                        were never touched after being set.
 evicted_unfetched      Number of valid items evicted from the LRU which were
                        never touched after being set.
+evicted_active         Number of valid items evicted from the LRU which were
+                       recently touched but were evicted before being moved to
+                       the top of the LRU again.
 crawler_reclaimed      Number of items freed by the LRU Crawler.
 lrutail_reflocked      Number of items found to be refcount locked in the
                        LRU tail.
@@ -740,9 +877,8 @@ future.
 
 The "stats" command with the argument of "sizes" returns information about the
 general size and count of all items stored in the cache.
-WARNING: This command WILL lock up your cache! It iterates over *every item*
-and examines the size. While the operation is fast, if you have many items
-you could prevent memcached from serving requests for several seconds.
+WARNING: In versions prior to 1.4.27 this command causes the cache server to
+lock while it iterates the items. 1.4.27 and greater are safe.
 
 The data is returned in the following format:
 
@@ -761,6 +897,36 @@ factor would save memory overhead. For example: generating more classes in the
 lower range could allow items to fit more snugly into their slab classes, if
 most of your items are less than 200 bytes in size.
 
+In 1.4.27 and after, this feature must be manually enabled.
+
+A "stats" command with the argument of "sizes_enable" will enable the
+histogram at runtime. This has a small overhead to every store or delete
+operation. If you don't want to incur this, leave it off.
+
+A "stats" command with the argument of "sizes_disable" will disable the
+histogram.
+
+It can also be enabled at starttime with "-o track_sizes"
+
+If disabled, "stats sizes" will return:
+
+STAT sizes_status disabled\r\n
+
+"stats sizes_enable" will return:
+
+STAT sizes_status enabled\r\n
+
+"stats sizes_disable" will return:
+
+STAT sizes_status disabled\r\n
+
+If an error happens, it will return:
+
+STAT sizes_status error\r\n
+STAT sizes_error [error_message]\r\n
+
+CAVEAT: If CAS support is disabled, you cannot enable/disable this feature at
+runtime.
 
 Slab statistics
 ---------------
@@ -895,6 +1061,12 @@ The delay option allows you to have them reset in e.g. 10 second
 intervals (by passing 0 to the first, 10 to the second, 20 to the
 third, etc. etc.).
 
+"cache_memlimit" is a command with a numeric argument. This allows runtime
+adjustments of the cache memory limit. It returns "OK\r\n" or an error (unless
+"noreply" is given as the last parameter). If the new memory limit is higher
+than the old one, the server may start requesting more memory from the OS. If
+the limit is lower, and slabs_reassign+automove are enabled, free memory may
+be released back to the OS asynchronously.
 
 "version" is a command with no arguments:
 
